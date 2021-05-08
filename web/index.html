@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<br lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>見守りカメラ【私はHAPPYです。】</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-giJF6kkoqNQ00vy+HMDP7azOuL0xtbfIcaT9wjKHr8RbDVddVHyTfAAsrekwKmP1" crossorigin="anonymous">
+    <script src="https://obniz.io/js/jquery-3.2.1.min.js"></script>
+    <script src="https://unpkg.com/obniz@3.14.0/obniz.js"></script>
+    <script src="./dist/face-api.min.js"></script>
+</head>
+<body>
+    <!-- obniz接続確認 -->
+    <!-- <div id="obniz-debug"></div> -->
+
+    <!-- ナビバー -->
+    <ul class="nav justify-content-center">
+        <li class="nav-item">
+            <button type="button" class="btn btn-primary" id="startAndStop" style="width:300px" disabled>Start</button>
+        </li>
+    </ul>
+    <img id="image" src="./mac.jpg" style="display:none">
+    <canvas id="outPutImage" class="rounded mx-auto d-block overflow-auto" width=800 height=600 style="border:1px solid;width:800px;-webkit-font-smoothing:none"></canvas>
+    <div id="notifiedLog" class="mx-auto d-block" style="border:1px solid;overflow-y:scroll;width:800px;height:100px"></div>
+    <div id="log" class="mx-auto d-block" style="border:1px solid;overflow-y:scroll;width:800px;height:100px"></div>
+    <ul class="nav justify-content-center">
+        <li class="nav-item">
+            <button type="button" class="btn btn-info" id="testSendLine">LINE通知テスト用ボタン</button>
+        </li>
+        <li class="nav-item">
+            <button type="button" class="btn btn-info" id="testNotify">LINE通知音用ボタン</button>
+        </li>
+    </ul>
+    <script>
+        
+        let obniz                  = new Obniz("#######");  //obnizIDを入力する
+        const DO_NOT_NOTIFY_PERIOD = 30000;                   //LINE通知を抑止する時間
+
+        let streaming    = false;  //ストリーミング判定フラグ
+        let initialized  = false;  //初期化判定フラグ
+        let isLineNotify = true;   //LINE通知判定フラグ
+        let cam          = "";     //カメラオブジェクト
+        let img          = document.getElementById('image')
+        let startAndStop = document.getElementById('startAndStop');
+        let notifiedLog  = document.getElementById('notifiedLog');
+        let canvas       = document.getElementById('outPutImage')
+        let ctx          = canvas.getContext("2d");
+
+        // obnizに接続する
+        obniz.onconnect = async function () {
+            let cam = obniz.wired("ArduCAMMini", { cs:0, mosi:1, miso:2, sclk:3, gnd:4, sda:6, scl:7, module_version:1 });
+
+            // obnizの接続が成功した場合、スタートストップボタンを有効化する
+            if (obniz.connectionState === "connected") {
+                startAndStop.disabled = false;
+            }
+
+            // スタートストップボタンをリスナーに登録する
+            startAndStop.addEventListener('click', () => {
+                if(!streaming) {
+                    onStreamingStarted(cam);
+                } else {
+                    onStreamingStoped();
+                }
+            });
+
+        }
+
+        // スタートボタンクリック時
+        async function onStreamingStarted(cam) {
+            _log("onStreamingStarted","started");
+            streaming = true;
+            startAndStop.innerText = 'Stop';
+            // 初期化処理
+            if (!initialized){
+                await init(cam);
+            }
+            await getImage(cam);
+        }
+
+        // ストップボタンクリック時
+        function onStreamingStoped() {
+            _log("onStreamingStoped","stoped");
+            streaming = false;
+            startAndStop.innerText = 'Start';
+        }
+
+        // スタートボタンクリック時（初期化）
+        async function init(cam) {
+            _log("init()","initialized");
+            initialized = true;
+            await faceapi.nets.faceExpressionNet.loadFromUri('./weights/')
+            await faceapi.nets.tinyFaceDetector.load("./weights/")
+            // obnizのカメラセットアップ
+            await cam.startupWait();
+        }
+
+        /**
+         * カメラから画像を取得する
+         * 
+         */
+        async function getImage(cam) {
+
+            async function processImage() {
+                if (!streaming) {
+                        return;
+                    }
+
+                try {
+                    // カメラから画像を取得する
+                    const data = await cam.takeWait('800x600'); //'160x120'or'176x144'or'320x240'or'352x288'or'640x480'or'800x600'or'1024x768'or'1280x960'or'1600x1200'を指定する
+                    const base64 = cam.arrayToBase64(data);
+                    document.getElementById("image").src = "data:image/jpeg;base64, " + base64;
+
+                    // 画像を解析する
+                    await detectFace();
+
+                    // 繰り返し
+                    window.requestAnimationFrame(processImage);
+                    
+                } catch (err) {
+                    _log("processImage", "error");
+                }
+            }
+            // 初回
+            window.requestAnimationFrame(processImage);
+        }
+
+        /**
+         * 取得したカメラ画像から顔検出情報を取得して、canvasへ描写する
+         * 
+         */
+        async function detectFace() {
+            const displaySize = { width: img.naturalWidth, height: img.naturalHeight }
+            const detections = await faceapi.detectAllFaces(img, new faceapi.TinyFaceDetectorOptions()).withFaceExpressions()
+            const resizedDetections = await faceapi.resizeResults(detections, displaySize)
+            // console.log(detections);
+            await ctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight);
+            await faceapi.draw.drawDetections(ctx,resizedDetections);
+            if (!detections.length || !isLineNotify) {
+                return;
+            }
+            detectData(detections);
+
+        }
+
+        /**
+         * 顔検出結果から表情を取得して、LINEへリクエストする
+         * 
+         */
+        async function detectData(detections) {
+            const resultExpression = await detections.map( data => {
+                return judgeExpression(data);
+            });
+            if (!isLineNotify) {
+                return;
+            }
+            _log("detectData_resultExpression", resultExpression)
+            if(resultExpression != "no_expression"){
+                fetch('/sendLine/' + resultExpression).then(response => {
+                    if (response.status == "200") {
+                        notifiedLine(response, resultExpression);
+                        console.log(response);
+                    };
+                });
+            }
+        }
+
+        /**
+         * 表情検出した結果から感情を抽出する。
+         * 
+         */
+        function judgeExpression(data) {
+
+            if (data.expressions.happy >= 0.8) {
+                return "happy"
+            };
+
+            // 他の表情を検出する場合には、以下のコードをコメントアウトする
+            // if (data.expressions.sad >= 0.8) {
+            //     return "sad"
+            // }
+            // if (data.expressions.angry >= 0.8){
+            //     return "angry"
+            // }
+            // if (data.expressions.surprised >= 0.8){
+            //     return "suprised"
+            // }
+
+            return "no_expression";
+        };
+
+        /**
+         * LINE通知をお知らせして、ログにスタンプを送ったことを表示する
+         * 
+         */
+        function notifiedLine(response, resultExpression) {
+
+            // 音声モジュールを再生する
+            obniz.io11.output(true);
+            setTimeout(obniz.io11.end(), 100);
+
+            
+            let date1 = new Date();
+            notifiedLog.innerText = date1.toLocaleString("ja") + ":" + resultExpression + "スタンプ送ったよ"
+
+            isLineNotify = false;
+            _log("notifiedLine", "isLineNotify=false")
+            
+            setTimeout(function(){
+                isLineNotify = true;
+                _log("notifiedLine", "isLineNotify=true")
+            }, DO_NOT_NOTIFY_PERIOD);
+        }
+
+        /**
+         * ログ出力用の関数
+         * 
+         */
+        function _log(methodName, msg) {
+            const date1 = new Date();
+            let log = document.getElementById("log");
+            log.innerHTML += date1.toLocaleString() + ":" + methodName + ":" + msg + "<br/>";
+            log.scrollTop = log.scrollHeight;
+        }
+        
+        /**
+         * テスト用
+         */
+
+        // LINE通知テスト用のスクリプト
+        let test = document.getElementById('testSendLine');
+        test.addEventListener('click', () => {
+            fetch('/sendLine/happy').then(response =>{
+                notifiedLine(response);
+                _log("testSendLine", response.state);
+            });
+        });
+
+        // LINE通知音声テスト用のスクリプト
+        let noti = document.getElementById('testNotify');
+        noti.addEventListener('click', () => {
+            obniz.io11.output(true);
+            setTimeout(obniz.io11.end(), 100);
+            _log("testSendLine", "execute");
+        });
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta1/dist/js/bootstrap.bundle.min.js" integrity="sha384-ygbV9kiqUc6oa4msXn9868pTtWMgiQaeYH7/t7LECLbyPA2x65Kgf80OJFdroafW" crossorigin="anonymous"></script>
+</body>
+</html>
